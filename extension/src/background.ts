@@ -409,7 +409,8 @@ const handlers: CommandHandlers = {
       lastFocusedWindow: true,
     });
     const activeTabId = focused[0]?.id ?? mapped.find((t) => t.active)?.id ?? null;
-    return { activeTabId, tabs: mapped };
+    const allowedFileAccess = await chrome.extension.isAllowedFileSchemeAccess();
+    return { activeTabId, allowedFileAccess, tabs: mapped };
   },
 
   async tabs_create(params) {
@@ -1106,6 +1107,25 @@ chrome.runtime.onMessage.addListener((rawMessage: unknown, _sender, sendResponse
     .catch(() => sendResponse(null));
 
   return true;
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local") return;
+  const change = changes[STORAGE_PORT_KEY];
+  if (!change) return;
+  const nextPort = change.newValue;
+  if (
+    typeof nextPort === "number" &&
+    Number.isInteger(nextPort) &&
+    nextPort >= 1 &&
+    nextPort <= 65535 &&
+    nextPort !== bridgePort
+  ) {
+    bridgePort = nextPort;
+    disconnectSocket();
+    backoffIndex = 0;
+    connectWebSocket();
+  }
 });
 
 void loadPortAndConnect();
