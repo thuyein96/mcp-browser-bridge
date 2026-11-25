@@ -292,6 +292,8 @@ async function main(): Promise<void> {
   const { server, client } = createMcpBrowserServer();
   const transport = new StdioServerTransport();
 
+  void ensureBridgeRunning().catch(() => undefined);
+
   let shuttingDown = false;
   const shutdown = (): void => {
     if (shuttingDown) {

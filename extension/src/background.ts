@@ -868,7 +868,10 @@ function scheduleReconnect(): void {
   }, delay);
 }
 
+let connectGen = 0;
+
 function disconnectSocket(): void {
+  connectGen += 1;
   stopPing();
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
@@ -891,17 +894,49 @@ function disconnectSocket(): void {
   connecting = false;
 }
 
-function connectWebSocket(): void {
+async function isBridgeReachable(port: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const resp = await fetch(`http://${DEFAULT_BRIDGE_HOST}:${port}/health`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function connectWebSocket(): Promise<void> {
   if (
-    socket &&
-    (socket.readyState === WebSocket.OPEN ||
-      socket.readyState === WebSocket.CONNECTING)
+    connecting ||
+    (socket &&
+      (socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING))
   ) {
     return;
   }
 
   connecting = true;
-  const url = `ws://${DEFAULT_BRIDGE_HOST}:${bridgePort}/ext`;
+  const gen = ++connectGen;
+  const targetPort = bridgePort;
+  const url = `ws://${DEFAULT_BRIDGE_HOST}:${targetPort}/ext`;
+
+  const reachable = await isBridgeReachable(targetPort);
+  if (gen !== connectGen) {
+    return;
+  }
+  if (!reachable) {
+    connecting = false;
+    lastError = `Waiting for bridge at ${DEFAULT_BRIDGE_HOST}:${targetPort}`;
+    void updateBadge(false);
+    scheduleReconnect();
+    return;
+  }
+
   let ws: WebSocket;
   try {
     ws = new WebSocket(url);
