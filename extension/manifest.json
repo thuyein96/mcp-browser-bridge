@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Claude Chrome Bridge",
+  "name": "MCP Browser Bridge for Claude Code",
   "version": "1.0.0",
   "description": "Connects Claude Code to Chrome for browser UI automation with unlimited large-file uploads.",
   "permissions": [
@@ -9,7 +9,8 @@
     "scripting",
     "activeTab",
     "alarms",
-    "storage"
+    "storage",
+    "userScripts"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -31,7 +32,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Claude Chrome Bridge",
+    "default_title": "MCP Browser Bridge for Claude Code",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",

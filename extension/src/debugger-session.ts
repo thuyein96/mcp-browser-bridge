@@ -142,6 +142,17 @@ function compileRegex(pattern: string, label: string): RegExp {
   }
 }
 
+/** chrome.debugger could not attach to (or stay attached to) a tab. */
+export class DebuggerUnavailableError extends Error {
+  constructor(
+    readonly tabId: number,
+    readonly reason: string,
+  ) {
+    super(`Chrome debugger unavailable on tab ${tabId}: ${reason}`);
+    this.name = "DebuggerUnavailableError";
+  }
+}
+
 export class DebuggerSessionManager {
   private readonly attachedTabs = new Set<number>();
   private readonly attachingPromises = new Map<number, Promise<void>>();
@@ -199,13 +210,21 @@ export class DebuggerSessionManager {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!/already attached/i.test(msg)) {
-        throw err;
+        // Typical cause: another extension injected a chrome-extension://
+        // frame into the tab, which Chrome refuses to let us debug.
+        throw new DebuggerUnavailableError(tabId, msg);
       }
     }
 
-    const domains = ["DOM", "Runtime", "Log", "Network", "Page"] as const;
-    for (const domain of domains) {
-      await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`);
+    try {
+      const domains = ["DOM", "Runtime", "Log", "Network", "Page"] as const;
+      for (const domain of domains) {
+        await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await chrome.debugger.detach({ tabId }).catch(() => undefined);
+      throw new DebuggerUnavailableError(tabId, msg);
     }
 
     this.attachedTabs.add(tabId);
@@ -227,6 +246,9 @@ export class DebuggerSessionManager {
         await this.ensureAttached(tabId);
         const retryResult = await chrome.debugger.sendCommand({ tabId }, method, params);
         return (retryResult ?? {}) as T;
+      }
+      if (/chrome-extension:\/\/ URL of different extension|cannot attach/i.test(msg)) {
+        throw new DebuggerUnavailableError(tabId, msg);
       }
       throw err;
     }

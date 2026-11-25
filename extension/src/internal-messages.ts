@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { ResolvedUploadFileSchema } from "../../shared/protocol";
 
+const MouseButtonSchema = z.enum(["left", "right", "middle"]);
+
 export const ContentRequestSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("ccb_read_page"),
@@ -36,6 +38,44 @@ export const ContentRequestSchema = z.discriminatedUnion("type", [
     selector: z.string().optional(),
     drop: z.boolean(),
   }),
+  z.object({
+    type: z.literal("ccb_cursor"),
+    op: z.enum(["move", "click", "scroll", "show"]),
+    x: z.number(),
+    y: z.number(),
+    button: MouseButtonSchema.optional(),
+    direction: z.enum(["up", "down", "left", "right"]).optional(),
+    fromX: z.number().optional(),
+    fromY: z.number().optional(),
+  }),
+  z.object({
+    type: z.literal("ccb_viewport"),
+  }),
+  z.object({
+    type: z.literal("ccb_synthetic_mouse"),
+    kind: z.enum(["click", "move", "drag", "scroll"]),
+    x: z.number(),
+    y: z.number(),
+    button: MouseButtonSchema.default("left"),
+    clickCount: z.number().int().min(1).max(3).default(1),
+    modifiers: z.number().int().default(0),
+    startX: z.number().optional(),
+    startY: z.number().optional(),
+    deltaX: z.number().default(0),
+    deltaY: z.number().default(0),
+  }),
+  z.object({
+    type: z.literal("ccb_synthetic_key"),
+    key: z.string(),
+    code: z.string(),
+    keyCode: z.number().int(),
+    text: z.string().optional(),
+    modifiers: z.number().int().default(0),
+  }),
+  z.object({
+    type: z.literal("ccb_synthetic_type"),
+    text: z.string(),
+  }),
 ]);
 export type ContentRequest = z.infer<typeof ContentRequestSchema>;
 
@@ -54,6 +94,13 @@ export const ResolveRefDataSchema = z.object({
   tag: z.string(),
 });
 export type ResolveRefData = z.infer<typeof ResolveRefDataSchema>;
+
+export const ViewportDataSchema = z.object({
+  width: z.number(),
+  height: z.number(),
+  devicePixelRatio: z.number(),
+});
+export type ViewportData = z.infer<typeof ViewportDataSchema>;
 
 export const StreamUploadDataSchema = z.object({
   count: z.number().int().nonnegative(),

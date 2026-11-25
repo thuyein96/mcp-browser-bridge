@@ -13,6 +13,8 @@
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.extension.json --noEmit",
     "test": "node --test dist/server/**/*.test.js",
     "test:e2e": "node scripts/e2e-chrome.mjs",
+    "test:e2e:cursor": "node scripts/e2e-cursor.mjs",
+    "package": "node scripts/package-extension.mjs",
     "start:bridge": "node dist/server/bridge.js",
     "start:mcp": "node dist/server/mcp-server.js"
   },
