@@ -18,24 +18,25 @@ In `auto` mode, the extension uses `cdp_zero_copy` when **Allow access to file U
 1. Build the project if you have not built it yet.
 
 ```bash
-cd /Users/thu-yein/Documents/claude-chrome-bridge
+git clone https://github.com/thuyein96/mcp-browser-bridge.git
+cd mcp-browser-bridge
 npm install
 npm run build
 ```
 
 2. Open `chrome://extensions` in Google Chrome.
 3. Turn on **Developer mode** in the top right corner.
-4. Click **Load unpacked** and select `/Users/thu-yein/Documents/claude-chrome-bridge/extension/dist`.
+4. Click **Load unpacked** and select the `extension/dist` folder inside the cloned repo.
 5. Click **Details** on **MCP Browser Bridge for Claude Code** and turn on **Allow access to file URLs**.
 
 Turning on **Allow access to file URLs** enables zero-copy multi-GB uploads. Without it, the extension still uploads large files through the loopback HTTP stream fallback.
 
 ## Connect Claude Code
 
-Run this command to register the MCP server with Claude Code.
+Run this command from the repo folder to register the MCP server with Claude Code. `$(pwd)` expands to the absolute path, which Claude Code needs.
 
 ```bash
-claude mcp add chrome-bridge -- node /Users/thu-yein/Documents/claude-chrome-bridge/dist/server/mcp-server.js
+claude mcp add chrome-bridge -- node "$(pwd)/dist/server/mcp-server.js"
 ```
 
 When Claude Code calls any browser tool, `mcp-server.js` checks `http://127.0.0.1:18923/health` and starts the local bridge daemon automatically if it is not running. Multiple Claude Code sessions share one Chrome connection.

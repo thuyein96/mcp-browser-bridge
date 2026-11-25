@@ -31,7 +31,7 @@ it can:
 
 Requirements: the companion bridge/MCP server (Node.js) must be installed and
 registered with Claude Code. Without it the extension stays idle. Setup:
-<link to your README or repository>
+https://github.com/thuyein96/mcp-browser-bridge#install-the-chrome-extension
 
 Privacy: the extension talks only to the bridge on 127.0.0.1. It has no
 analytics and sends nothing to any server of its own. See the privacy policy.
