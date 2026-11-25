@@ -31,6 +31,7 @@ await Promise.all([
     entryPoints: [path.join(extSrcDir, "content.ts")],
     outfile: path.join(outDir, "content.js"),
     format: "iife",
+    define: { __CCB_BUILD__: JSON.stringify(String(Date.now())) },
   }),
   build({
     ...common,

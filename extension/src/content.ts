@@ -3,10 +3,26 @@ import {
   type ContentRequest,
   type ContentResponseEnvelope,
 } from "./internal-messages";
+import {
+  clickCursor,
+  cursorPosition,
+  moveCursor,
+  scrollCursor,
+  showCursorAt,
+} from "./cursor-overlay";
+import {
+  scrollIntoViewVisibly,
+  syntheticClick,
+  syntheticDrag,
+  syntheticHover,
+  syntheticKey,
+  syntheticScroll,
+  syntheticType,
+} from "./synthetic-input";
 
 declare global {
   interface Window {
-    __ccbContentLoaded?: boolean;
+    __ccbContentLoaded?: boolean | string;
     __ccbGetElementByRef?: (ref: string) => Element | null;
   }
 }
@@ -480,6 +496,7 @@ function handleFind(req: Extract<ContentRequest, { type: "ccb_find" }>): {
     rect: { x: number; y: number; width: number; height: number };
     inputType?: string;
     accept?: string;
+    src?: string;
   }>;
 } {
   const queryLower = req.query.trim().toLowerCase();
@@ -573,6 +590,7 @@ function handleFind(req: Extract<ContentRequest, { type: "ccb_find" }>): {
     rect: { x: number; y: number; width: number; height: number };
     inputType?: string;
     accept?: string;
+    src?: string;
   }> = [];
 
   for (const item of scored) {
@@ -594,6 +612,7 @@ function handleFind(req: Extract<ContentRequest, { type: "ccb_find" }>): {
       },
       inputType: el instanceof HTMLInputElement ? el.type : undefined,
       accept: el.getAttribute("accept") ?? undefined,
+      src: el instanceof HTMLIFrameElement ? el.src || undefined : undefined,
     });
     if (matches.length >= req.limit) break;
   }
@@ -717,14 +736,14 @@ function handleFormInput(
   };
 }
 
-function handleResolveRef(
+async function handleResolveRef(
   req: Extract<ContentRequest, { type: "ccb_resolve_ref" }>,
-): {
+): Promise<{
   x: number;
   y: number;
   rect: { x: number; y: number; width: number; height: number };
   tag: string;
-} {
+}> {
   let el: Element | null = null;
   if (req.ref) {
     el = resolveRefElement(req.ref);
@@ -738,7 +757,9 @@ function handleResolveRef(
     );
   }
 
-  el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+  // Smooth-scroll only when the target is off-screen, so the page visibly
+  // travels to it (and the cursor follows) instead of jumping.
+  await scrollIntoViewVisibly(el);
   const rect = el.getBoundingClientRect();
   return {
     x: Math.round(rect.left + rect.width / 2),
@@ -911,6 +932,63 @@ async function handleContentRequest(req: ContentRequest): Promise<unknown> {
       return handleResolveRef(req);
     case "ccb_stream_upload":
       return handleStreamUpload(req);
+    case "ccb_cursor": {
+      const from =
+        req.fromX !== undefined && req.fromY !== undefined
+          ? { x: req.fromX, y: req.fromY }
+          : undefined;
+      switch (req.op) {
+        case "show":
+          await showCursorAt(req.x, req.y);
+          break;
+        case "move":
+          await moveCursor(req.x, req.y, from);
+          break;
+        case "click":
+          if (!cursorPosition()) await moveCursor(req.x, req.y, from);
+          await clickCursor(req.x, req.y, req.button ?? "left");
+          break;
+        case "scroll":
+          if (!cursorPosition()) await moveCursor(req.x, req.y, from);
+          await scrollCursor(req.x, req.y, req.direction ?? "down");
+          break;
+        default: {
+          const _exhaustiveOp: never = req.op;
+          throw new Error(`Unhandled cursor op: ${String(_exhaustiveOp)}`);
+        }
+      }
+      return { x: req.x, y: req.y };
+    }
+    case "ccb_viewport":
+      return {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+      };
+    case "ccb_synthetic_mouse":
+      switch (req.kind) {
+        case "click":
+          return syntheticClick(req.x, req.y, req.button, req.clickCount, req.modifiers);
+        case "move":
+          return { tag: syntheticHover(req.x, req.y, req.modifiers).tagName.toLowerCase() };
+        case "drag":
+          syntheticDrag(req.startX ?? req.x, req.startY ?? req.y, req.x, req.y, req.modifiers);
+          return {};
+        case "scroll":
+          await syntheticScroll(req.x, req.y, req.deltaX, req.deltaY, req.modifiers);
+          return { scrollX: window.scrollX, scrollY: window.scrollY };
+        default: {
+          const _exhaustiveKind: never = req.kind;
+          throw new Error(`Unhandled synthetic mouse kind: ${String(_exhaustiveKind)}`);
+        }
+      }
+    case "ccb_synthetic_key":
+      return syntheticKey(
+        { key: req.key, code: req.code, keyCode: req.keyCode, text: req.text },
+        req.modifiers,
+      );
+    case "ccb_synthetic_type":
+      return syntheticType(req.text);
     default: {
       const _exhaustive: never = req;
       throw new Error(`Unhandled content request: ${String(_exhaustive)}`);
@@ -918,8 +996,11 @@ async function handleContentRequest(req: ContentRequest): Promise<unknown> {
   }
 }
 
-if (!window.__ccbContentLoaded) {
-  window.__ccbContentLoaded = true;
+// Keyed by build so a reloaded extension's fresh script takes over from an
+// orphaned copy left in an already-open tab (whose runtime is invalidated).
+declare const __CCB_BUILD__: string;
+if (window.__ccbContentLoaded !== __CCB_BUILD__) {
+  window.__ccbContentLoaded = __CCB_BUILD__;
   window.__ccbGetElementByRef = resolveRefElement;
 
   chrome.runtime.onMessage.addListener((rawMessage: unknown, _sender, sendResponse) => {

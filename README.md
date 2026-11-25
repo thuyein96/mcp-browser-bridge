@@ -1,10 +1,10 @@
-# Claude Chrome Bridge
+# MCP Browser Bridge for Claude Code
 
-Claude Chrome Bridge connects Claude Code to Google Chrome through a local Model Context Protocol (MCP) server and a Manifest V3 extension. It exposes the browser automation tools from Claude in Chrome and removes the 10 MB file upload limit so Claude Code can upload large videos such as TikTok clips.
+MCP Browser Bridge for Claude Code connects Claude Code to Google Chrome through a local Model Context Protocol (MCP) server and a Manifest V3 extension. It exposes the browser automation tools from Claude in Chrome and removes the 10 MB file upload limit so Claude Code can upload large videos such as TikTok clips.
 
 ## How large file uploads work
 
-Claude Chrome Bridge supports two upload paths without sending file bytes through Chrome Native Messaging.
+MCP Browser Bridge for Claude Code supports two upload paths without sending file bytes through Chrome Native Messaging.
 
 | Mode | Mechanism | Limit | Typical speed for 50 MB |
 | --- | --- | --- | --- |
@@ -26,7 +26,7 @@ npm run build
 2. Open `chrome://extensions` in Google Chrome.
 3. Turn on **Developer mode** in the top right corner.
 4. Click **Load unpacked** and select `/Users/thu-yein/Documents/claude-chrome-bridge/extension/dist`.
-5. Click **Details** on **Claude Chrome Bridge** and turn on **Allow access to file URLs**.
+5. Click **Details** on **MCP Browser Bridge for Claude Code** and turn on **Allow access to file URLs**.
 
 Turning on **Allow access to file URLs** enables zero-copy multi-GB uploads. Without it, the extension still uploads large files through the loopback HTTP stream fallback.
 
@@ -62,13 +62,29 @@ The `file_upload` tool accepts one or more local paths in `paths` and supports `
 - `read_page`: Extract the interactive accessibility tree with `ref_N` element handles, including hidden file inputs.
 - `get_page_text`: Read visible page text.
 - `find`: Search elements by text, label, role, or CSS selector.
-- `computer`: Capture screenshots and send mouse clicks, drags, scrolls, key chords, typed text, or waits.
+- `computer`: Capture screenshots and send mouse clicks, drags, scrolls, key chords, typed text, or waits. Pointer actions glide a visible orange **Claude** cursor to the target and show a ripple on each click.
 - `form_input`: Fill React, Vue, or native form controls by `ref`.
 - `file_upload`: Attach local files of unlimited size to `<input type="file">`, dynamic file choosers, or drag-and-drop zones.
-- `javascript_tool`: Evaluate JavaScript in the page main world.
+- `javascript_tool`: Evaluate JavaScript in the page main world. `let`/`const` can be redeclared across calls, and top-level `await`/`return` work.
 - `read_console_messages`: Read captured console logs and errors.
 - `read_network_requests`: Read captured network requests and responses.
 - `resize_window`: Resize the browser window.
+
+## When the Chrome debugger is blocked
+
+Chrome refuses `chrome.debugger.attach` on any tab that contains a frame from another extension (error: `Cannot access a chrome-extension:// URL of different extension`). Some extensions, such as audio or recording helpers, inject a hidden iframe into every page, which blocks CDP everywhere.
+
+When that happens the bridge falls back automatically, and each result reports the path it used in `via`:
+
+| Action | Normal path | Fallback |
+| --- | --- | --- |
+| Screenshot | `Page.captureScreenshot` | `chrome.tabs.captureVisibleTab` (activates the tab; scaled to CSS pixels so image coordinates match click coordinates) |
+| Click, hover, drag, scroll, type, key | `Input.dispatch*` (trusted events) | DOM events from the content script (`via: "synthetic"`), with focus, caret placement, text insertion, Enter-to-submit, Tab and scrolling emulated |
+| `javascript_tool` | `Runtime.evaluate` | `chrome.userScripts.execute` (`via: "userScripts"`, works on pages whose CSP forbids eval), else `chrome.scripting` + eval (`via: "scripting"`) |
+
+Synthetic events have `isTrusted === false`. Most sites accept them, including React apps such as Facebook, but a few ignore them. Console and network capture still need the debugger.
+
+To use the CSP-proof JavaScript path, open `chrome://extensions`, click **Details** on **MCP Browser Bridge for Claude Code**, and turn on **Allow User Scripts**.
 
 ## Verify locally
 
@@ -79,4 +95,5 @@ npm run typecheck
 npm run build
 npm test
 npm run test:e2e
+npm run test:e2e:cursor   # debugger-blocked fallbacks + visible cursor
 ```

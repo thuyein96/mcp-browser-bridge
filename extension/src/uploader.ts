@@ -554,7 +554,7 @@ function isNotAllowedError(err: unknown): boolean {
 }
 
 const FILE_ACCESS_HINT =
-  'Enable "Allow access to file URLs" in chrome://extensions for Claude Chrome Bridge to unlock instant zero-copy multi-GB uploads.';
+  'Enable "Allow access to file URLs" in chrome://extensions for MCP Browser Bridge for Claude Code to unlock instant zero-copy multi-GB uploads.';
 
 export async function executeFileUpload(
   debuggerMgr: DebuggerSessionManager,

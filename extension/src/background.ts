@@ -11,13 +11,17 @@ import {
   type TabInfo,
 } from "../../shared/protocol";
 import { sendToContentScript } from "./content-bridge";
-import { DebuggerSessionManager } from "./debugger-session";
+import { DebuggerSessionManager, DebuggerUnavailableError } from "./debugger-session";
 import {
   PopupRequestSchema,
   ResolveRefDataSchema,
+  ViewportDataSchema,
   type ActivityEntry,
+  type ContentRequest,
   type PopupState,
 } from "./internal-messages";
+
+type SyntheticMouseRequest = Extract<ContentRequest, { type: "ccb_synthetic_mouse" }>;
 import { executeFileUpload } from "./uploader";
 
 const KEEPALIVE_ALARM = "ccb-keepalive";
@@ -387,6 +391,456 @@ async function dispatchKeyChord(
   });
 }
 
+async function dispatchDrag(
+  tabId: number,
+  sx: number,
+  sy: number,
+  ex: number,
+  ey: number,
+  modifiers: number,
+): Promise<void> {
+  await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: sx,
+    y: sy,
+    modifiers,
+  });
+  await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: sx,
+    y: sy,
+    button: "left",
+    buttons: 1,
+    clickCount: 1,
+    modifiers,
+  });
+  const steps = 8;
+  for (let i = 1; i <= steps; i++) {
+    await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: Math.round(sx + ((ex - sx) * i) / steps),
+      y: Math.round(sy + ((ey - sy) * i) / steps),
+      button: "left",
+      buttons: 1,
+      modifiers,
+    });
+  }
+  await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: ex,
+    y: ey,
+    button: "left",
+    buttons: 0,
+    clickCount: 1,
+    modifiers,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Visible cursor
+// ---------------------------------------------------------------------------
+
+type MouseButtonName = "left" | "right" | "middle";
+
+/** Last cursor spot per tab, so a new page's cursor starts where the old one was. */
+const cursorPositions = new Map<number, { x: number; y: number }>();
+/** Last cursor spot in any tab, for tabs that have never shown the cursor. */
+let lastCursor: { x: number; y: number } | null = null;
+chrome.tabs.onRemoved.addListener((tabId) => cursorPositions.delete(tabId));
+
+async function showCursor(
+  tabId: number,
+  op: "move" | "click" | "scroll" | "show",
+  x: number,
+  y: number,
+  extra: { button?: MouseButtonName; direction?: "up" | "down" | "left" | "right" } = {},
+): Promise<void> {
+  const from = cursorPositions.get(tabId) ?? lastCursor ?? undefined;
+  cursorPositions.set(tabId, { x, y });
+  lastCursor = { x, y };
+  try {
+    await sendToContentScript(tabId, {
+      type: "ccb_cursor",
+      op,
+      x,
+      y,
+      button: extra.button,
+      direction: extra.direction,
+      fromX: from?.x,
+      fromY: from?.y,
+    });
+  } catch {
+    // The cursor is cosmetic; pages that block content scripts
+    // (chrome://, Web Store) still get the real input.
+  }
+}
+
+/** After a page load, bring the cursor back where it was so it doesn't vanish. */
+async function reshowCursorAfterLoad(tabId: number): Promise<void> {
+  const at = cursorPositions.get(tabId) ?? lastCursor;
+  if (!at) return;
+  await showCursor(tabId, "show", at.x, at.y);
+}
+
+async function viewportCenter(tabId: number): Promise<[number, number]> {
+  try {
+    const vp = ViewportDataSchema.parse(
+      await sendToContentScript(tabId, { type: "ccb_viewport" }),
+    );
+    return [Math.round(vp.width / 2), Math.round(vp.height / 2)];
+  } catch {
+    return [400, 400];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CDP-blocked fallbacks
+// ---------------------------------------------------------------------------
+
+type InputVia = "cdp" | "synthetic";
+
+/**
+ * Run real input through CDP; if Chrome refuses to attach the debugger to the
+ * tab, deliver DOM events from the content script instead.
+ */
+async function viaCdpOrSynthetic(
+  tabId: number,
+  cdp: () => Promise<void>,
+  synthetic: ContentRequest,
+): Promise<{ via: InputVia; target?: unknown }> {
+  try {
+    await cdp();
+    return { via: "cdp" };
+  } catch (err) {
+    if (!(err instanceof DebuggerUnavailableError)) throw err;
+    const target = await sendToContentScript(tabId, synthetic);
+    return { via: "synthetic", target };
+  }
+}
+
+function syntheticMouse(
+  kind: SyntheticMouseRequest["kind"],
+  x: number,
+  y: number,
+  extra: Partial<Omit<SyntheticMouseRequest, "type" | "kind" | "x" | "y">> = {},
+): SyntheticMouseRequest {
+  return {
+    type: "ccb_synthetic_mouse",
+    kind,
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+    modifiers: 0,
+    deltaX: 0,
+    deltaY: 0,
+    ...extra,
+  };
+}
+
+function syntheticKeyRequest(chord: string, extraModifiers: number): ContentRequest {
+  let modifiers = extraModifiers;
+  let primary: string | null = null;
+  for (const part of chord.split("+").filter(Boolean)) {
+    const bit = MODIFIER_BITS[part.toLowerCase()];
+    if (bit !== undefined) modifiers |= bit;
+    else primary = part;
+  }
+  if (!primary) throw new Error(`Invalid key specification "${chord}"`);
+  const spec = resolveKeySpec(primary);
+  return {
+    type: "ccb_synthetic_key",
+    key: spec.key,
+    code: spec.code,
+    keyCode: spec.keyCode,
+    text: spec.text,
+    modifiers,
+  };
+}
+
+async function captureViaCdp(tabId: number): Promise<ScreenshotResult> {
+  const rawShot = await debuggerMgr.send(tabId, "Page.captureScreenshot", {
+    format: "png",
+  });
+  const shot = ScreenshotCdpSchema.parse(rawShot);
+  let width: number | undefined;
+  let height: number | undefined;
+  try {
+    const rawMetrics = await debuggerMgr.send(tabId, "Page.getLayoutMetrics");
+    const metrics = LayoutMetricsSchema.safeParse(rawMetrics);
+    if (metrics.success) {
+      const vp = metrics.data.cssLayoutViewport ?? metrics.data.layoutViewport;
+      if (vp) {
+        width = Math.round(vp.clientWidth);
+        height = Math.round(vp.clientHeight);
+      }
+    }
+  } catch {
+    // Layout metrics are optional.
+  }
+  return { tabId, mimeType: "image/png", base64: shot.data, width, height };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+/** Scale a device-pixel PNG down to CSS pixels so image coords match click coords. */
+async function scalePng(base64: string, width: number, height: number): Promise<string> {
+  const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+  const bitmap = await createImageBitmap(blob);
+  if (bitmap.width === width && bitmap.height === height) return base64;
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return base64;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bitmap, 0, 0, width, height);
+  const out = await canvas.convertToBlob({ type: "image/png" });
+  return bytesToBase64(new Uint8Array(await out.arrayBuffer()));
+}
+
+/** Screenshot without the debugger: captureVisibleTab on the (activated) tab. */
+async function captureViaTabs(tabId: number): Promise<ScreenshotResult> {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.active) {
+    await chrome.tabs.update(tabId, { active: true });
+    await sleep(300);
+  }
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+  let base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  let width: number | undefined;
+  let height: number | undefined;
+  try {
+    const vp = ViewportDataSchema.parse(
+      await sendToContentScript(tabId, { type: "ccb_viewport" }),
+    );
+    width = Math.round(vp.width);
+    height = Math.round(vp.height);
+    base64 = await scalePng(base64, width, height);
+  } catch {
+    // Keep the device-pixel image if the viewport size is unavailable.
+  }
+  return { tabId, mimeType: "image/png", base64, width, height };
+}
+
+async function evaluateViaCdp(
+  tabId: number,
+  code: string,
+): Promise<{ value: unknown; type: string; subtype?: string }> {
+  const evaluate = async (expression: string) => {
+    const raw = await debuggerMgr.send(tabId, "Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+      // Console semantics: let/const may be redeclared across calls.
+      replMode: true,
+    });
+    return RuntimeEvalResultSchema.parse(raw);
+  };
+
+  let outcome = await evaluate(code);
+  if (outcome.exceptionDetails) {
+    const errDesc =
+      outcome.exceptionDetails.exception?.description ?? outcome.exceptionDetails.text;
+    if (/SyntaxError/i.test(errDesc)) {
+      outcome = await evaluate(`(async () => {\n${code}\n})()`);
+    }
+  }
+
+  if (outcome.exceptionDetails) {
+    const detail =
+      outcome.exceptionDetails.exception?.description ?? outcome.exceptionDetails.text;
+    throw new Error(`JavaScript evaluation failed: ${detail}`);
+  }
+
+  return {
+    value:
+      outcome.result.value !== undefined
+        ? outcome.result.value
+        : (outcome.result.description ?? null),
+    type: outcome.result.type,
+    subtype: outcome.result.subtype,
+  };
+}
+
+const MainWorldResultSchema = z.discriminatedUnion("ok", [
+  z.object({
+    ok: z.literal(true),
+    value: z.unknown(),
+    type: z.string(),
+    subtype: z.string().optional(),
+  }),
+  z.object({ ok: z.literal(false), error: z.string() }),
+]);
+
+interface UserScriptsExecuteApi {
+  execute(details: {
+    target: { tabId: number };
+    world: "MAIN" | "USER_SCRIPT";
+    js: Array<{ code: string }>;
+    injectImmediately?: boolean;
+  }): Promise<Array<{ result?: unknown; error?: string }>>;
+}
+
+const USER_SCRIPTS_HINT =
+  "Turn on \"Allow User Scripts\" for MCP Browser Bridge for Claude Code in chrome://extensions → Details " +
+  "to run JavaScript on pages whose CSP forbids eval while the debugger is blocked.";
+
+/**
+ * JavaScript without the debugger, via chrome.userScripts.execute: the code is
+ * injected as a real script, so page CSPs without 'unsafe-eval' (Facebook,
+ * Hacker News) don't block it. Returns null when the API is not enabled.
+ */
+async function evaluateViaUserScripts(
+  tabId: number,
+  code: string,
+): Promise<{ value: unknown; type: string; via: "userScripts" } | null> {
+  const api = (chrome as unknown as { userScripts?: Partial<UserScriptsExecuteApi> })
+    .userScripts;
+  if (typeof api?.execute !== "function") return null;
+  const execute = api.execute.bind(api);
+
+  const run = async (source: string) => {
+    const [injection] = await execute({
+      target: { tabId },
+      world: "MAIN",
+      js: [{ code: source }],
+      injectImmediately: true,
+    });
+    return injection;
+  };
+
+  // userScripts.execute reports neither thrown exceptions nor syntax errors:
+  // both just yield an empty result. So the code is wrapped to (a) return
+  // thrown errors as a marker object and (b) set a per-call run flag, which
+  // tells "did not parse" apart from "ran and produced undefined" without
+  // ever running the code twice.
+  const ERROR_KEY = "__ccbError";
+  const catchClause = `catch (__ccbErr) { RET({ ${ERROR_KEY}: String((__ccbErr && __ccbErr.stack) || __ccbErr) }) }`;
+  const flagFor = (nonce: string) => `void (globalThis.__ccbJsRun = ${JSON.stringify(nonce)});`;
+
+  const ranWith = async (nonce: string): Promise<boolean> =>
+    (await run("globalThis.__ccbJsRun"))?.result === nonce;
+
+  const unwrap = (injection: { result?: unknown; error?: string } | undefined): unknown => {
+    if (injection?.error) throw new Error(`JavaScript evaluation failed: ${injection.error}`);
+    const result = injection?.result;
+    if (result && typeof result === "object" && ERROR_KEY in result) {
+      throw new Error(`JavaScript evaluation failed: ${String((result as Record<string, unknown>)[ERROR_KEY])}`);
+    }
+    return result;
+  };
+
+  // 1. As a script: the try block keeps let/const out of the page's shared
+  //    global scope and its completion value is the last statement's value.
+  const scriptNonce = crypto.randomUUID();
+  let value = unwrap(
+    await run(
+      `try {\n${flagFor(scriptNonce)}\n${code}\n} ${catchClause.replace("RET", "")}`,
+    ),
+  );
+
+  // 2. Didn't parse as a script (top-level await/return): async function body.
+  if (value == null && !(await ranWith(scriptNonce))) {
+    const asyncNonce = crypto.randomUUID();
+    value = unwrap(
+      await run(
+        `(async () => { ${flagFor(asyncNonce)} try {\n${code}\n} ${catchClause.replace("RET", "return ")} })()`,
+      ),
+    );
+    if (value == null && !(await ranWith(asyncNonce))) {
+      throw new Error(
+        "JavaScript evaluation failed: SyntaxError (the page's DevTools console has the details)",
+      );
+    }
+  }
+
+  return { value: value === undefined ? null : value, type: typeof value, via: "userScripts" };
+}
+
+/** JavaScript without the debugger: userScripts if enabled, else scripting + eval. */
+async function evaluateInMainWorld(
+  tabId: number,
+  code: string,
+): Promise<{ value: unknown; type: string; subtype?: string; via: "userScripts" | "scripting" }> {
+  const viaUserScripts = await evaluateViaUserScripts(tabId, code);
+  if (viaUserScripts) return viaUserScripts;
+  return evaluateViaScriptingEval(tabId, code);
+}
+
+/** chrome.scripting in the main world; subject to the page's CSP (needs 'unsafe-eval'). */
+async function evaluateViaScriptingEval(
+  tabId: number,
+  code: string,
+): Promise<{ value: unknown; type: string; subtype?: string; via: "scripting" }> {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [code],
+    // Serialized into the page: must not reference anything outside itself.
+    func: async (source: string) => {
+      const indirectEval = eval;
+      try {
+        let value: unknown;
+        try {
+          value = indirectEval(source);
+        } catch (err) {
+          if (!(err instanceof SyntaxError)) throw err;
+          value = indirectEval(`(async () => {\n${source}\n})()`);
+        }
+        value = await value;
+        const subtype =
+          value === null
+            ? "null"
+            : Array.isArray(value)
+              ? "array"
+              : value instanceof Node
+                ? "node"
+                : undefined;
+        let out: unknown;
+        if (value instanceof Element) {
+          out = value.outerHTML.slice(0, 500);
+        } else {
+          try {
+            out = value === undefined ? null : JSON.parse(JSON.stringify(value));
+          } catch {
+            out = String(value);
+          }
+        }
+        return { ok: true as const, value: out, type: typeof value, subtype };
+      } catch (err) {
+        return {
+          ok: false as const,
+          error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+        };
+      }
+    },
+  });
+
+  const parsed = MainWorldResultSchema.safeParse(injection?.result);
+  if (!parsed.success) {
+    throw new Error("JavaScript evaluation returned no result (page may block scripting)");
+  }
+  if (!parsed.data.ok) {
+    const hint = /unsafe-eval|Content Security Policy/i.test(parsed.data.error)
+      ? ` (this page's CSP forbids eval and the debugger is blocked on this tab. ${USER_SCRIPTS_HINT})`
+      : "";
+    throw new Error(`JavaScript evaluation failed: ${parsed.data.error}${hint}`);
+  }
+  return {
+    value: parsed.data.value,
+    type: parsed.data.type,
+    subtype: parsed.data.subtype,
+    via: "scripting",
+  };
+}
+
 type CommandByMethod<M extends BridgeCommand["method"]> = Extract<
   BridgeCommand,
   { method: M }
@@ -423,6 +877,7 @@ const handlers: CommandHandlers = {
     }
     if (params.url && /^https?:\/\//i.test(params.url) && created.status !== "complete") {
       await waitForTabLoad(created.id, 5_000);
+      await reshowCursorAfterLoad(created.id);
     }
     const fresh = await chrome.tabs.get(created.id);
     return toTabInfo(fresh);
@@ -478,6 +933,7 @@ const handlers: CommandHandlers = {
     }
 
     await loadPromise;
+    await reshowCursorAfterLoad(tabId);
     const updated = await chrome.tabs.get(tabId);
     return toTabInfo(updated);
   },
@@ -539,80 +995,58 @@ const handlers: CommandHandlers = {
     const tabId = await resolveTabId(params.tabId);
     const modifiers = parseModifierBitmask(params.modifiers);
 
+    const click = async (
+      button: MouseButtonName,
+      clickCount: number,
+    ): Promise<Record<string, unknown>> => {
+      const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
+      await showCursor(tabId, "move", x, y);
+      await showCursor(tabId, "click", x, y, { button });
+      const outcome = await viaCdpOrSynthetic(
+        tabId,
+        () => dispatchMouseClicks(tabId, x, y, button, clickCount, modifiers),
+        syntheticMouse("click", x, y, { button, clickCount, modifiers }),
+      );
+      return { action: params.action, tabId, x, y, ...outcome };
+    };
+
     switch (params.action) {
       case "screenshot": {
-        const rawShot = await debuggerMgr.send(tabId, "Page.captureScreenshot", {
-          format: "png",
-        });
-        const shot = ScreenshotCdpSchema.parse(rawShot);
-        let width: number | undefined;
-        let height: number | undefined;
         try {
-          const rawMetrics = await debuggerMgr.send(
-            tabId,
-            "Page.getLayoutMetrics",
-          );
-          const metrics = LayoutMetricsSchema.safeParse(rawMetrics);
-          if (metrics.success) {
-            const vp =
-              metrics.data.cssLayoutViewport ?? metrics.data.layoutViewport;
-            if (vp) {
-              width = Math.round(vp.clientWidth);
-              height = Math.round(vp.clientHeight);
-            }
-          }
-        } catch {
-          // Layout metrics are optional.
+          return await captureViaCdp(tabId);
+        } catch (err) {
+          if (!(err instanceof DebuggerUnavailableError)) throw err;
+          return captureViaTabs(tabId);
         }
-        const result: ScreenshotResult = {
-          tabId,
-          mimeType: "image/png",
-          base64: shot.data,
-          width,
-          height,
-        };
-        return result;
       }
 
-      case "left_click": {
-        const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await dispatchMouseClicks(tabId, x, y, "left", 1, modifiers);
-        return { action: params.action, tabId, x, y };
-      }
-
-      case "right_click": {
-        const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await dispatchMouseClicks(tabId, x, y, "right", 1, modifiers);
-        return { action: params.action, tabId, x, y };
-      }
-
-      case "double_click": {
-        const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await dispatchMouseClicks(tabId, x, y, "left", 2, modifiers);
-        return { action: params.action, tabId, x, y };
-      }
-
-      case "triple_click": {
-        const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await dispatchMouseClicks(tabId, x, y, "left", 3, modifiers);
-        return { action: params.action, tabId, x, y };
-      }
-
-      case "middle_click": {
-        const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await dispatchMouseClicks(tabId, x, y, "middle", 1, modifiers);
-        return { action: params.action, tabId, x, y };
-      }
+      case "left_click":
+        return click("left", 1);
+      case "right_click":
+        return click("right", 1);
+      case "double_click":
+        return click("left", 2);
+      case "triple_click":
+        return click("left", 3);
+      case "middle_click":
+        return click("middle", 1);
 
       case "hover": {
         const [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x,
-          y,
-          modifiers,
-        });
-        return { action: params.action, tabId, x, y };
+        await showCursor(tabId, "move", x, y);
+        const outcome = await viaCdpOrSynthetic(
+          tabId,
+          async () => {
+            await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+              type: "mouseMoved",
+              x,
+              y,
+              modifiers,
+            });
+          },
+          syntheticMouse("move", x, y, { modifiers }),
+        );
+        return { action: params.action, tabId, x, y, ...outcome };
       }
 
       case "left_click_drag": {
@@ -625,75 +1059,61 @@ const handlers: CommandHandlers = {
           params.coordinate,
           params.ref,
         );
-        await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x: sx,
-          y: sy,
-          modifiers,
-        });
-        await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-          type: "mousePressed",
-          x: sx,
-          y: sy,
-          button: "left",
-          buttons: 1,
-          clickCount: 1,
-          modifiers,
-        });
-        const steps = 8;
-        for (let i = 1; i <= steps; i++) {
-          const ix = Math.round(sx + ((ex - sx) * i) / steps);
-          const iy = Math.round(sy + ((ey - sy) * i) / steps);
-          await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-            type: "mouseMoved",
-            x: ix,
-            y: iy,
-            button: "left",
-            buttons: 1,
-            modifiers,
-          });
-        }
-        await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-          type: "mouseReleased",
-          x: ex,
-          y: ey,
-          button: "left",
-          buttons: 0,
-          clickCount: 1,
-          modifiers,
-        });
-        return { action: params.action, tabId, from: [sx, sy], to: [ex, ey] };
+        await showCursor(tabId, "move", sx, sy);
+        await showCursor(tabId, "click", sx, sy, { button: "left" });
+        const [, outcome] = await Promise.all([
+          showCursor(tabId, "move", ex, ey),
+          viaCdpOrSynthetic(
+            tabId,
+            () => dispatchDrag(tabId, sx, sy, ex, ey, modifiers),
+            syntheticMouse("drag", ex, ey, { startX: sx, startY: sy, modifiers }),
+          ),
+        ]);
+        return { action: params.action, tabId, from: [sx, sy], to: [ex, ey], ...outcome };
       }
 
       case "scroll": {
-        let x = 400;
-        let y = 400;
-        if (params.coordinate || params.ref) {
-          [x, y] = await resolveCoordinate(tabId, params.coordinate, params.ref);
-        }
+        const [x, y] =
+          params.coordinate || params.ref
+            ? await resolveCoordinate(tabId, params.coordinate, params.ref)
+            : await viewportCenter(tabId);
         const distance = (params.scrollAmount ?? 3) * 120;
         const dir = params.scrollDirection ?? "down";
+        await showCursor(tabId, "move", x, y);
+        await showCursor(tabId, "scroll", x, y, { direction: dir });
         const deltaX = dir === "left" ? -distance : dir === "right" ? distance : 0;
         const deltaY = dir === "up" ? -distance : dir === "down" ? distance : 0;
-        await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
-          type: "mouseWheel",
-          x,
-          y,
-          deltaX,
-          deltaY,
-          modifiers,
-        });
-        return { action: params.action, tabId, x, y, deltaX, deltaY };
+        const outcome = await viaCdpOrSynthetic(
+          tabId,
+          async () => {
+            await debuggerMgr.send(tabId, "Input.dispatchMouseEvent", {
+              type: "mouseWheel",
+              x,
+              y,
+              deltaX,
+              deltaY,
+              modifiers,
+            });
+            await sleep(350); // Let the wheel animation play before the next action.
+          },
+          syntheticMouse("scroll", x, y, { deltaX, deltaY, modifiers }),
+        );
+        return { action: params.action, tabId, x, y, deltaX, deltaY, ...outcome };
       }
 
       case "type": {
         if (params.text === undefined) {
           throw new Error('type action requires "text"');
         }
-        await debuggerMgr.send(tabId, "Input.insertText", {
-          text: params.text,
-        });
-        return { action: params.action, tabId, length: params.text.length };
+        const text = params.text;
+        const outcome = await viaCdpOrSynthetic(
+          tabId,
+          async () => {
+            await debuggerMgr.send(tabId, "Input.insertText", { text });
+          },
+          { type: "ccb_synthetic_type", text },
+        );
+        return { action: params.action, tabId, length: text.length, ...outcome };
       }
 
       case "key": {
@@ -702,12 +1122,18 @@ const handlers: CommandHandlers = {
         }
         const chords = params.text.trim().split(/\s+/).filter(Boolean);
         const repeat = params.repeat ?? 1;
+        let via: InputVia = "cdp";
         for (let r = 0; r < repeat; r++) {
           for (const chord of chords) {
-            await dispatchKeyChord(tabId, chord, modifiers);
+            const outcome = await viaCdpOrSynthetic(
+              tabId,
+              () => dispatchKeyChord(tabId, chord, modifiers),
+              syntheticKeyRequest(chord, modifiers),
+            );
+            via = outcome.via;
           }
         }
-        return { action: params.action, tabId, keys: params.text, repeat };
+        return { action: params.action, tabId, keys: params.text, repeat, via };
       }
 
       case "wait": {
@@ -730,41 +1156,12 @@ const handlers: CommandHandlers = {
 
   async javascript_tool(params) {
     const tabId = await resolveTabId(params.tabId);
-    const evaluate = async (expression: string) => {
-      const raw = await debuggerMgr.send(tabId, "Runtime.evaluate", {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-        userGesture: true,
-      });
-      return RuntimeEvalResultSchema.parse(raw);
-    };
-
-    let outcome = await evaluate(params.code);
-    if (outcome.exceptionDetails) {
-      const errDesc =
-        outcome.exceptionDetails.exception?.description ??
-        outcome.exceptionDetails.text;
-      if (/SyntaxError/i.test(errDesc)) {
-        outcome = await evaluate(`(async () => {\n${params.code}\n})()`);
-      }
+    try {
+      return await evaluateViaCdp(tabId, params.code);
+    } catch (err) {
+      if (!(err instanceof DebuggerUnavailableError)) throw err;
+      return evaluateInMainWorld(tabId, params.code);
     }
-
-    if (outcome.exceptionDetails) {
-      const detail =
-        outcome.exceptionDetails.exception?.description ??
-        outcome.exceptionDetails.text;
-      throw new Error(`JavaScript evaluation failed: ${detail}`);
-    }
-
-    return {
-      value:
-        outcome.result.value !== undefined
-          ? outcome.result.value
-          : (outcome.result.description ?? null),
-      type: outcome.result.type,
-      subtype: outcome.result.subtype,
-    };
   },
 
   async read_console_messages(params) {
